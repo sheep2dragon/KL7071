@@ -1,0 +1,165 @@
+//==========================================================================
+// Data				:	2016-09-22
+// Author			:	Chen Biao
+// Email			:	biao.chen@keliangtek.com
+// purpose			:	
+//--------------------------------------------------------------------------
+// Revision record	:
+// data			person			issue number		detail
+//
+//==========================================================================
+`timescale 1 ns / 1 ns
+
+module optic_rx(
+    input 					reset,
+    input 					clk_rx,								//clk 250m
+    //debug info, clk rx domain
+    output reg 				rx_comm_err,						//LC channel rx communication error, 1:err 0: normal
+    output reg 				rx_verify_err,						//LC channel rx verify error, 1:err 0: normal
+    //serial data
+    input 					phy_rxd,
+    //user interface, clk rx domain
+    output reg 	[7:0]		rxd_data
+	);
+
+reg 	[2:0]				rx_state;
+parameter 					IDLE				= 3'h0;
+parameter 					RX_HEADER			= 3'h1;
+parameter 					RX_DATA				= 3'h2;
+parameter 					RX_TAIL				= 3'h4;
+
+parameter 					BIT6_CNT			= 6'd31;		//1 50m clk equal 5 250m, 7-8 50m
+
+//-------------------------signal definition--------------------------------
+//-------------------------signal definition--------------------------------
+//clk rx domain
+reg 	[4:0]				phy_rxd_dly;
+reg 						phy_rxd_negedge;
+reg 						phy_rxd_posedge;
+reg 	[5:0]				sync_bit_clk_cnt;
+reg 	[2:0]				bit_clk_cnt;				//1-5, 20ns
+reg 	[2:0]				bit_cnt;					//0-7, 8 bits of 1 byte
+reg 						byte_cnt=1'b0;					//0-1, 2 bytes
+reg 	[7:0]				rxd_data_shift_reg='d0;
+reg 	[7:0]				verify_shift_reg;
+
+//--------------------------------------------------------------------------
+//--------------------------------------------------------------------------
+always @(posedge clk_rx)
+begin
+	phy_rxd_dly <= {phy_rxd_dly[3:0],phy_rxd};
+	phy_rxd_negedge <= ~phy_rxd_dly[2] & phy_rxd_dly[3];
+	phy_rxd_posedge <= phy_rxd_dly[2] & ~phy_rxd_dly[3];
+end
+
+//--------------------------------------------------------------------------
+//--------------------------------------------------------------------------
+//sync cnt
+always @(posedge clk_rx)
+begin
+	if (phy_rxd_negedge==1'b1 || phy_rxd_posedge==1'b1)
+		sync_bit_clk_cnt[5:0] <= 6'd0;
+	else
+		sync_bit_clk_cnt[5:0] <= sync_bit_clk_cnt[5:0] + 6'd1;
+end
+
+always @(posedge clk_rx)
+begin
+	if (phy_rxd_negedge==1'b1 || phy_rxd_posedge==1'b1)
+		rx_comm_err <= 1'b0;
+	else if (sync_bit_clk_cnt[5:0]>=6'd63)
+		rx_comm_err <= 1'b1;
+	else ;
+end
+
+//receive state machine
+always @(posedge clk_rx)
+begin
+	if (reset)
+		rx_state <= IDLE;
+	else if (rx_state==IDLE && sync_bit_clk_cnt[5:0]>=BIT6_CNT && phy_rxd_dly[3]==1'b0)
+		rx_state <= RX_HEADER;
+	else if (rx_state==RX_HEADER && bit_clk_cnt[2:0]>=3'd5)
+		rx_state <= RX_DATA;
+	else if (rx_state==RX_DATA && bit_clk_cnt[2:0]>=3'd5 && bit_cnt[2:0]>=3'd7 && byte_cnt==1'b1)
+		rx_state <= RX_TAIL;
+	else if (rx_state==RX_TAIL && sync_bit_clk_cnt[5:0]>=BIT6_CNT && phy_rxd_dly[3]==1'b1)
+		rx_state <= IDLE;
+	else ;
+end
+
+//--------------------------------------------------------------------------
+//receive cnt
+always @(posedge clk_rx)
+begin
+	if (reset)
+		bit_clk_cnt[2:0] <= 3'd0;
+	else if (rx_state==RX_HEADER && phy_rxd_posedge==1'b1)
+		bit_clk_cnt[2:0] <= 3'd1;								//last bit of header 8'h01
+	else if (rx_state==RX_DATA && bit_clk_cnt[2:0]>=3'd5 && bit_cnt[2:0]>=3'd7 && byte_cnt==1'b1)
+		bit_clk_cnt[2:0] <= 3'd0;								//last bit of data
+	else if (bit_clk_cnt[2:0]>=3'd5)
+		bit_clk_cnt[2:0] <= 3'd1;
+	else if (bit_clk_cnt[2:0]>3'd0)
+		bit_clk_cnt[2:0] <= bit_clk_cnt[2:0] + 3'd1;
+	else ;
+end
+
+always @(posedge clk_rx)
+begin
+	if (reset)
+		bit_cnt[2:0] <= 3'd0;
+	else if (rx_state==RX_HEADER && phy_rxd_posedge==1'b1)
+		bit_cnt[2:0] <= 3'd0;
+	else if (rx_state==RX_DATA && bit_clk_cnt[2:0]>=3'd5 && bit_cnt[2:0]>=3'd7 && byte_cnt==1'b1)
+		bit_cnt[2:0] <= 3'd0;								//last bit of data
+	else if (rx_state==RX_DATA && bit_clk_cnt[2:0]>=3'd5)
+		bit_cnt[2:0] <= bit_cnt[2:0] + 3'd1;
+	else ;
+end
+
+always @(posedge clk_rx)
+begin
+	if (rx_state==RX_HEADER && phy_rxd_posedge==1'b1)
+		byte_cnt <= 1'b0;
+	else if (rx_state==RX_DATA && bit_clk_cnt[2:0]>=3'd5 && bit_cnt[2:0]>=3'd7)
+		byte_cnt <= ~byte_cnt;
+	else ;
+end
+
+//--------------------------------------------------------------------------
+//receive data shift reg
+always @(posedge clk_rx)
+begin
+	if (rx_state==RX_DATA && bit_clk_cnt[2:0]==3'd3 && byte_cnt==1'b0)
+		rxd_data_shift_reg[7:0] <= {rxd_data_shift_reg[6:0],phy_rxd_dly[4]};
+	else ;
+end
+
+//receive verify shift reg
+always @(posedge clk_rx)
+begin
+	if (rx_state==RX_DATA && bit_clk_cnt[2:0]==3'd3 && byte_cnt==1'b1)
+		verify_shift_reg[7:0] <= {verify_shift_reg[6:0],phy_rxd_dly[4]};
+	else ;
+end
+
+//receive verify bit, 1:err 0:normal
+always @(posedge clk_rx)
+begin
+	if (rx_state==RX_TAIL && rxd_data_shift_reg[7:0]==(~verify_shift_reg[7:0]))
+		rx_verify_err <= 1'b0;
+	else if (rx_state==RX_TAIL)
+		rx_verify_err <= 1'b1;
+	else ;
+end
+
+//refresh data when verify correct
+always @(posedge clk_rx)
+begin
+	if (rx_state==RX_TAIL && sync_bit_clk_cnt[5:0]>=BIT6_CNT && phy_rxd_dly[3]==1'b1 && rx_verify_err==1'b0)
+		rxd_data[7:0] <= rxd_data_shift_reg[7:0];
+	else ;
+end
+
+endmodule

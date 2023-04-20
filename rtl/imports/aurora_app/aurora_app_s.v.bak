@@ -1,0 +1,495 @@
+//==========================================================================
+// Data				:	2017-07-02
+// Author			:	Chen Biao
+// Email			:	biao.chen@keliangtek.com
+// purpose			:	
+//--------------------------------------------------------------------------
+// Revision record	:
+// data			person			issue number		detail
+//
+//==========================================================================
+`timescale 1 ns / 1 ns
+
+module aurora_app_s#(
+    parameter 				PORT_NUM = 1,
+    parameter 				CH_NUM = 14,
+    parameter 				SYS_CLK_FREQ = 125,			//Clock frequency Unit: MHz
+    parameter 				AURORA_TX_PERIOD = 10,		//unit us
+    parameter 				AURORA_TX_CNT_WIDTH = 11	//for count width of sfp tx period
+	)
+	(    
+    input 					reset,
+    input 					clk_sys,					//change to 100m
+	input					clk_125m,
+    //initial information
+    input 					channel_up,
+/* 	//optic tx port
+    output reg  [CH_NUM-1:0] 		tx_wea_s,
+    output reg 				tx_waddr,							//0: vc, 1: st   20180312, be care of fanout, timing critical
+    output reg 	[31:0]		tx_wdata,
+    output reg 				sfp_rx_end_extend,
+    //optic rx port
+    input 	 	[CH_NUM*8-1:0]	 	rxd_data_o, */
+	//optic tx port
+	output reg [CH_NUM*32-1:0]	vc_trans_data,
+	output reg [CH_NUM*32-1:0]	st_trans_data,
+	output reg 				sfp_rx_end_extend,
+	 //optic rx port
+    input 	 	[CH_NUM*8-1:0]	 	rxd_data_o,
+	
+	//aurora tx rx start / end
+    output reg              a7_aurora_rx_start,
+    output reg              a7_aurora_rx_end,
+    output reg              a7_aurora_tx_start,
+    output reg              a7_aurora_tx_end,
+	//backplane aurora axis rx from k7 fpga, clk 200m domain
+(*mark_debug = "true"*)    input  		[PORT_NUM*32-1:0]   	m_axis_tdata_rfifo,
+(*mark_debug = "true"*)    input  		[PORT_NUM-1:0]      	m_axis_tvalid_rfifo,
+(*mark_debug = "true"*)    input  		[PORT_NUM-1:0]      	m_axis_tlast_rfifo,
+	//backplane aurora axis tx to k7 fpga, clk 200m domain
+(*mark_debug = "true"*)    output   	[PORT_NUM*32-1:0]   	s_axis_tdata_tfifo,
+(*mark_debug = "true"*)    output   	[PORT_NUM-1:0]      	s_axis_tvalid_tfifo,
+(*mark_debug = "true"*)    output   	[PORT_NUM-1:0]      	s_axis_tlast_tfifo,
+(*mark_debug = "true"*)    input 		[PORT_NUM-1:0]			s_axis_tready_tfifo
+	);
+
+localparam 					AURORA_TX_PERIOD_CLK_NUM	= SYS_CLK_FREQ * AURORA_TX_PERIOD;
+
+localparam 					VC_HEADER		= 4'h5;
+localparam 					ST_HEADER		= 4'hA;
+localparam 					FC_HEADER		= 4'hC;
+localparam 					FC_PAYLOAD		= 12'h78D;
+localparam 					AURORA_SERDES_HEADER	= 32'hEB905716;
+localparam 					AURORA_RX_OVERFLOW		= 10'h280;		//640*8=5.12us
+
+
+localparam					CH_INDEX0		= 1;
+localparam					CH_INDEX1		= 2;
+localparam					CH_INDEX2		= 3;
+localparam					CH_INDEX3		= 4;
+localparam					CH_INDEX4		= 5;
+localparam					CH_INDEX5		= 6;
+localparam					CH_INDEX6		= 7;
+localparam					CH_INDEX7		= 8;
+localparam					CH_INDEX8		= 9;
+localparam					CH_INDEX9		= 10;
+localparam					CH_INDEX10		= 11;
+localparam					CH_INDEX11		= 12;
+localparam					CH_INDEX12		= 13;
+localparam					CH_INDEX13		= 14;
+
+
+//-------------------------signal definition--------------------------------
+//-------------------------signal definition--------------------------------
+//--------------------------------------------------------------------------
+//clk sys domain
+reg 						s_axis_tvalid;
+reg 	[31:0]				s_axis_tdata;
+reg 						s_axis_tlast;
+reg 						m_axis_tvalid_rfifo_1dly,m_axis_tvalid_rfifo_2dly;
+reg 	[31:0]				m_axis_tdata_rfifo_1dly,m_axis_tdata_rfifo_2dly;
+reg 						m_axis_tlast_rfifo_1dly,m_axis_tlast_rfifo_2dly;
+reg 	[1:0]				sfp_rx_state_p;
+localparam 					SFP_IDLE			= 2'd0;
+localparam 					SFP_RX				= 2'd1;
+localparam 					SFP_RX_END			= 2'd2;
+reg 	[9:0]				sfp_rx_overflow_cnt;
+reg 						sfp_rx_overflow;
+reg 						sfp_init_rcnt;					//0-1, 1 header
+reg 						sfp_rx_end;
+reg 	[3:0]				sfp_rx_end_dly;
+reg 	[CH_NUM*8-1:0]				rxd_data_shift_reg='d0;
+reg 	[AURORA_TX_CNT_WIDTH-1:0]		aurora_tx_gap_cnt='d0;
+reg 						aurora_tx_start;
+reg 	[3:0]				aurora_tx_cnt;
+
+reg     [7:0]               a7_aurora_rx_start_cnt;
+reg     [7:0]               a7_aurora_rx_end_cnt;
+reg     [7:0]               a7_aurora_tx_start_cnt;
+reg     [7:0]               a7_aurora_tx_end_cnt;
+
+
+wire 						m_axis_tvalid_rfifo_100m;
+wire 	[31:0]				m_axis_tdata_rfifo_100m;
+wire 						m_axis_tlast_rfifo_100m;
+
+(*mark_debug = "true"*)wire	s_axis_tready_debug/*synthesis syn_keep = 1 */;
+
+//-------------------------ipcore & module----------------------------------
+//-------------------------ipcore & module----------------------------------
+// fifo_512x33_dual_clk 	U_sync_tfifo(
+    // .m_aclk(clk_sys),
+    // .s_aclk(clk_sys),
+    // .s_aresetn(~reset),
+    // .s_axis_tvalid(s_axis_tvalid),
+    // .s_axis_tready(),
+    // .s_axis_tdata(s_axis_tdata[31:0]),
+    // .s_axis_tlast(s_axis_tlast),
+    // .m_axis_tvalid(s_axis_tvalid_tfifo),
+    // .m_axis_tready(s_axis_tready_tfifo),
+    // .m_axis_tdata(s_axis_tdata_tfifo[31:0]),
+    // .m_axis_tlast(s_axis_tlast_tfifo),
+    // .axis_wr_data_count(),
+    // .axis_rd_data_count()
+// );
+
+
+	fifo_512x33_dual_clk 	U_tx_sync_tfifo(
+            .m_aclk(clk_125m),
+            .s_aclk(clk_sys),
+            .s_aresetn(~reset),
+            .s_axis_tvalid(s_axis_tvalid),
+            .s_axis_tready(s_axis_tready_debug),
+            .s_axis_tdata(s_axis_tdata),
+            .s_axis_tlast(s_axis_tlast),
+            .m_axis_tvalid(s_axis_tvalid_tfifo),
+            .m_axis_tready(s_axis_tready_tfifo),
+            .m_axis_tdata(s_axis_tdata_tfifo),
+            .m_axis_tlast(s_axis_tlast_tfifo),
+            .axis_wr_data_count(),
+            .axis_rd_data_count()
+        );
+	
+	fifo_512x33_dual_clk 	U_rx_sync_rfifo(
+            .m_aclk(clk_sys),
+            .s_aclk(clk_125m),
+            .s_aresetn(~reset),
+            .s_axis_tvalid(m_axis_tvalid_rfifo),
+            .s_axis_tready(),
+            .s_axis_tdata(m_axis_tdata_rfifo),
+            .s_axis_tlast(m_axis_tlast_rfifo),
+            .m_axis_tvalid(m_axis_tvalid_rfifo_100m),
+            .m_axis_tready(1'b1),
+            .m_axis_tdata(m_axis_tdata_rfifo_100m),
+            .m_axis_tlast(m_axis_tlast_rfifo_100m),
+            .axis_wr_data_count(),
+            .axis_rd_data_count()
+        );
+//--------------------------------------------------------------------------
+//--------------------------------------------------------------------------
+//clk sys domain
+//--------------------------------------------------------------------------
+//--------------------------------------------------------------------------
+always @(posedge clk_sys)
+begin
+	m_axis_tvalid_rfifo_1dly <= m_axis_tvalid_rfifo_100m;
+	m_axis_tvalid_rfifo_2dly <= m_axis_tvalid_rfifo_1dly;
+	m_axis_tdata_rfifo_1dly <= m_axis_tdata_rfifo_100m;
+	m_axis_tdata_rfifo_2dly <= m_axis_tdata_rfifo_1dly;
+	m_axis_tlast_rfifo_1dly <= m_axis_tlast_rfifo_100m;
+	m_axis_tlast_rfifo_2dly <= m_axis_tlast_rfifo_1dly;
+	//
+	// tx_wdata <= {12'd0, m_axis_tdata_rfifo_2dly[19:0]};
+	sfp_rx_end_dly <= {sfp_rx_end_dly[2:0], sfp_rx_end};
+	sfp_rx_end_extend <= | sfp_rx_end_dly | sfp_rx_end;
+end
+
+//--------------------------------------------------------------------------
+//--------------------------------------------------------------------------a7 aurora rx start
+always @(posedge clk_sys)
+begin
+    if(a7_aurora_rx_start_cnt[7:0]>8'd0)
+        a7_aurora_rx_start <= 1'b1;
+    else
+        a7_aurora_rx_start <= 1'b0;
+end
+
+always @(posedge clk_sys)
+begin
+    if(reset)
+        a7_aurora_rx_start_cnt[7:0] <= 8'd0;
+    else if(a7_aurora_rx_start_cnt[7:0]>=DELAY_1US)
+        a7_aurora_rx_start_cnt[7:0] <= 8'd0;
+    else if(sfp_rx_state_p==SFP_IDLE && m_axis_tvalid_rfifo_1dly==1'b1 && m_axis_tvalid_rfifo_2dly==1'b0)
+        a7_aurora_rx_start_cnt[7:0] <= 8'd1;
+    else if(a7_aurora_rx_start_cnt[7:0]>8'd0)
+        a7_aurora_rx_start_cnt[7:0] <= a7_aurora_rx_start_cnt[7:0] + 1'b1;
+    else ;
+end
+
+always @(posedge clk_sys)
+begin
+    if(a7_aurora_rx_end_cnt[7:0]>8'd0)
+        a7_aurora_rx_end <= 1'b1;
+    else
+        a7_aurora_rx_end <= 1'b0;
+end
+
+always @(posedge clk_sys)
+begin
+    if(reset)
+        a7_aurora_rx_end_cnt[7:0] <= 8'd0;
+    else if(a7_aurora_rx_end_cnt[7:0]>=DELAY_1US)
+        a7_aurora_rx_end_cnt[7:0] <= 8'd0;
+    else if(m_axis_tvalid_rfifo_2dly==1'b1 && m_axis_tlast_rfifo_2dly==1'b1)
+        a7_aurora_rx_end_cnt[7:0] <= 8'd1;
+    else if(a7_aurora_rx_end_cnt[7:0]>8'd0)
+        a7_aurora_rx_end_cnt[7:0] <= a7_aurora_rx_end_cnt[7:0] + 1'b1;
+    else ;
+end
+//--------------------------------------------------------------------------
+//--------------------------------------------------------------------------a7 aurora rx end
+always @(posedge clk_sys)
+begin
+    if(a7_aurora_tx_start_cnt[7:0]>8'd0)
+        a7_aurora_tx_start <= 1'b1;
+    else
+        a7_aurora_tx_start <= 1'b0;
+end
+
+always @(posedge clk_sys)
+begin
+    if(reset)
+        a7_aurora_tx_start_cnt[7:0] <= 8'd0;
+    else if(a7_aurora_tx_start_cnt[7:0]>=DELAY_1US)
+        a7_aurora_tx_start_cnt[7:0] <= 8'd0;
+    else if(aurora_tx_start==1'b1)
+        a7_aurora_tx_start_cnt[7:0] <= 8'd1;
+    else if(a7_aurora_tx_start_cnt[7:0]>8'd0)
+        a7_aurora_tx_start_cnt[7:0] <= a7_aurora_tx_start_cnt[7:0] + 1'b1;
+    else ;
+end
+
+always @(posedge clk_sys)
+begin
+    if(a7_aurora_tx_end_cnt[7:0]>8'd0)
+        a7_aurora_tx_end <= 1'b1;
+    else
+        a7_aurora_tx_end <= 1'b0;
+end
+
+always @(posedge clk_sys)
+begin
+    if(reset)
+        a7_aurora_tx_end_cnt[7:0] <= 8'd0;
+    else if(a7_aurora_tx_end_cnt[7:0]>=DELAY_1US)
+        a7_aurora_tx_end_cnt[7:0] <= 8'd0;
+    else if(aurora_tx_cnt[3:0]>=4'd14)
+        a7_aurora_tx_end_cnt[7:0] <= 8'd1;
+    else if(a7_aurora_tx_end_cnt[7:0]>8'd0)
+        a7_aurora_tx_end_cnt[7:0] <= a7_aurora_tx_end_cnt[7:0] + 1'b1;
+    else ;
+end
+//--------------------------------------------------------------------------
+//--------------------------------------------------------------------------aurora rx
+//sfp rx state
+always @(posedge clk_sys)
+begin
+	if (reset)
+		sfp_rx_state_p <= SFP_IDLE;
+	else if (sfp_rx_overflow==1'b1)
+		sfp_rx_state_p <= SFP_IDLE;
+	else if (sfp_rx_state_p==SFP_IDLE && m_axis_tvalid_rfifo_1dly==1'b1 && m_axis_tvalid_rfifo_2dly==1'b0)
+		sfp_rx_state_p <= SFP_RX;
+	else if (m_axis_tvalid_rfifo_2dly==1'b1 && m_axis_tlast_rfifo_2dly==1'b1)
+		sfp_rx_state_p <= SFP_RX_END;
+	else if (sfp_rx_state_p==SFP_RX_END)
+		sfp_rx_state_p <= SFP_IDLE;
+	else ;
+end
+
+always @(posedge clk_sys)
+begin
+	if (reset)
+		sfp_init_rcnt <= 1'd0;
+	else if (sfp_rx_state_p==SFP_IDLE && m_axis_tvalid_rfifo_1dly==1'b1 && m_axis_tvalid_rfifo_2dly==1'b0)
+		sfp_init_rcnt <= 1'd1;
+	else if (m_axis_tvalid_rfifo_2dly==1'b1 && sfp_init_rcnt==1'b1)
+		sfp_init_rcnt <= 1'd0;
+	else ;
+end
+
+//--------------------------------------------------------------------------traffic rx
+/* always @(posedge clk_sys)
+begin
+	if (m_axis_tvalid_rfifo_2dly==1'b1 && sfp_init_rcnt==1'b0)
+		case (m_axis_tdata_rfifo_2dly[31:28])
+			VC_HEADER: tx_waddr <= 1'b0;
+			ST_HEADER: tx_waddr <= 1'b1;
+			default: ;
+		endcase
+	else ;
+end
+
+//sfp rx ram
+always @(posedge clk_sys)
+begin
+	if (m_axis_tvalid_rfifo_2dly==1'b1 && sfp_init_rcnt==1'b0
+			&& (m_axis_tdata_rfifo_2dly[31:28]==VC_HEADER || m_axis_tdata_rfifo_2dly[31:28]==ST_HEADER))
+		case (m_axis_tdata_rfifo_2dly[27:20])
+			8'd0:	tx_wea_s[13:0] <= 14'h0001;
+			8'd1:	tx_wea_s[13:0] <= 14'h0002;
+			8'd2:	tx_wea_s[13:0] <= 14'h0004;
+			8'd3:	tx_wea_s[13:0] <= 14'h0008;
+			8'd4:	tx_wea_s[13:0] <= 14'h0010;
+			8'd5:	tx_wea_s[13:0] <= 14'h0020;
+			8'd6:	tx_wea_s[13:0] <= 14'h0040;
+			8'd7:	tx_wea_s[13:0] <= 14'h0080;
+			8'd8:	tx_wea_s[13:0] <= 14'h0100;
+			8'd9:	tx_wea_s[13:0] <= 14'h0200;
+			8'd10:	tx_wea_s[13:0] <= 14'h0400;
+			8'd11:	tx_wea_s[13:0] <= 14'h0800;
+			8'd12:	tx_wea_s[13:0] <= 14'h1000;
+			8'd13:	tx_wea_s[13:0] <= 14'h2000;
+			default: tx_wea_s[13:0] <= 14'd0;
+		endcase
+	else
+		tx_wea_s[13:0] <= 14'd0;
+end */
+//----------------------------------------------------------------------------------------------------------------	
+always @(posedge clk_sys)
+begin
+	if(reset)
+		vc_trans_data[447:0] <= 448'd0;
+	else if(m_axis_tvalid_rfifo_2dly==1'b1 && sfp_init_rcnt==1'b0 && m_axis_tdata_rfifo_2dly[31:28]==VC_HEADER)
+		case(m_axis_tdata_rfifo_2dly[27:20])                        
+			8'd0:	vc_trans_data[CH_INDEX0*32-1:0]				 	<= m_axis_tdata_rfifo_2dly[31:0];
+			8'd1:	vc_trans_data[CH_INDEX1*32-1:CH_INDEX0*32] 		<= m_axis_tdata_rfifo_2dly[31:0];
+			8'd2:	vc_trans_data[CH_INDEX2*32-1:CH_INDEX1*32] 		<= m_axis_tdata_rfifo_2dly[31:0];
+			8'd3:	vc_trans_data[CH_INDEX3*32-1:CH_INDEX2*32] 		<= m_axis_tdata_rfifo_2dly[31:0];
+			8'd4:	vc_trans_data[CH_INDEX4*32-1:CH_INDEX3*32] 		<= m_axis_tdata_rfifo_2dly[31:0];
+			8'd5:	vc_trans_data[CH_INDEX5*32-1:CH_INDEX4*32] 		<= m_axis_tdata_rfifo_2dly[31:0];
+			8'd6:	vc_trans_data[CH_INDEX6*32-1:CH_INDEX5*32] 		<= m_axis_tdata_rfifo_2dly[31:0];
+			8'd7:	vc_trans_data[CH_INDEX7*32-1:CH_INDEX6*32] 		<= m_axis_tdata_rfifo_2dly[31:0];
+			8'd8:	vc_trans_data[CH_INDEX8*32-1:CH_INDEX7*32] 		<= m_axis_tdata_rfifo_2dly[31:0];
+			8'd9:	vc_trans_data[CH_INDEX9*32-1:CH_INDEX8*32] 		<= m_axis_tdata_rfifo_2dly[31:0];
+			8'd10:	vc_trans_data[CH_INDEX10*32-1:CH_INDEX9*32] 	<= m_axis_tdata_rfifo_2dly[31:0];
+			8'd11:	vc_trans_data[CH_INDEX11*32-1:CH_INDEX10*32] 	<= m_axis_tdata_rfifo_2dly[31:0];
+			8'd12:	vc_trans_data[CH_INDEX12*32-1:CH_INDEX11*32] 	<= m_axis_tdata_rfifo_2dly[31:0];
+			8'd13:	vc_trans_data[CH_INDEX13*32-1:CH_INDEX12*32] 	<= m_axis_tdata_rfifo_2dly[31:0];
+			default: ;
+		endcase
+	else ;
+end
+	
+always @(posedge clk_sys)
+begin
+	if(reset)
+		st_trans_data[447:0] <= 448'd0;
+	else if(m_axis_tvalid_rfifo_2dly==1'b1 && sfp_init_rcnt==1'b0 && m_axis_tdata_rfifo_2dly[31:28]==ST_HEADER)
+		case(m_axis_tdata_rfifo_2dly[27:20])
+			8'd0:	st_trans_data[CH_INDEX0*32-1:0]				 	<= m_axis_tdata_rfifo_2dly[31:0];
+			8'd1:	st_trans_data[CH_INDEX1*32-1:CH_INDEX0*32] 		<= m_axis_tdata_rfifo_2dly[31:0];
+			8'd2:	st_trans_data[CH_INDEX2*32-1:CH_INDEX1*32] 		<= m_axis_tdata_rfifo_2dly[31:0];
+			8'd3:	st_trans_data[CH_INDEX3*32-1:CH_INDEX2*32] 		<= m_axis_tdata_rfifo_2dly[31:0];
+			8'd4:	st_trans_data[CH_INDEX4*32-1:CH_INDEX3*32] 		<= m_axis_tdata_rfifo_2dly[31:0];
+			8'd5:	st_trans_data[CH_INDEX5*32-1:CH_INDEX4*32] 		<= m_axis_tdata_rfifo_2dly[31:0];
+			8'd6:	st_trans_data[CH_INDEX6*32-1:CH_INDEX5*32] 		<= m_axis_tdata_rfifo_2dly[31:0];
+			8'd7:	st_trans_data[CH_INDEX7*32-1:CH_INDEX6*32] 		<= m_axis_tdata_rfifo_2dly[31:0];
+			8'd8:	st_trans_data[CH_INDEX8*32-1:CH_INDEX7*32] 		<= m_axis_tdata_rfifo_2dly[31:0];
+			8'd9:	st_trans_data[CH_INDEX9*32-1:CH_INDEX8*32] 		<= m_axis_tdata_rfifo_2dly[31:0];
+			8'd10:	st_trans_data[CH_INDEX10*32-1:CH_INDEX9*32] 	<= m_axis_tdata_rfifo_2dly[31:0];
+			8'd11:	st_trans_data[CH_INDEX11*32-1:CH_INDEX10*32] 	<= m_axis_tdata_rfifo_2dly[31:0];
+			8'd12:	st_trans_data[CH_INDEX12*32-1:CH_INDEX11*32] 	<= m_axis_tdata_rfifo_2dly[31:0];
+			8'd13:	st_trans_data[CH_INDEX13*32-1:CH_INDEX12*32] 	<= m_axis_tdata_rfifo_2dly[31:0];
+			default: ;
+		endcase
+	else ;
+end
+//----------------------------------------------------------------------------------------------------------------
+//sfp rx ram
+always @(posedge clk_sys)
+begin
+	if (m_axis_tvalid_rfifo_2dly==1'b1 && m_axis_tlast_rfifo_2dly==1'b1)
+		sfp_rx_end <= 1'b1;
+	else
+		sfp_rx_end <= 1'b0;
+end
+
+//--------------------------------------------------------------------------
+//aurora rx overflow
+always @(posedge clk_sys)
+begin
+	if (reset)
+		sfp_rx_overflow_cnt[9:0] <= 10'd0;
+	else if (sfp_rx_state_p==SFP_IDLE && m_axis_tvalid_rfifo_1dly==1'b1 && m_axis_tvalid_rfifo_2dly==1'b0)
+		sfp_rx_overflow_cnt[9:0] <= 10'd1;
+	else if (m_axis_tvalid_rfifo_2dly==1'b1 && m_axis_tlast_rfifo_2dly==1'b1)
+		sfp_rx_overflow_cnt[9:0] <= 10'd0;
+	else if (sfp_rx_overflow_cnt[9:0]>=AURORA_RX_OVERFLOW)
+		sfp_rx_overflow_cnt[9:0] <= 10'd0;
+	else if (sfp_rx_overflow_cnt[9:0]>10'd0)
+		sfp_rx_overflow_cnt[9:0] <= sfp_rx_overflow_cnt[9:0] + 10'd1;
+	else ;
+end
+
+always @(posedge clk_sys)
+begin
+	if (sfp_rx_overflow_cnt[9:0]>=AURORA_RX_OVERFLOW)
+		sfp_rx_overflow <= 1'b1;
+	else
+		sfp_rx_overflow <= 1'b0;
+end
+
+//--------------------------------------------------------------------------
+//--------------------------------------------------------------------------aurora tx
+//aurora tx period count
+always @(posedge clk_sys)
+begin
+	if (aurora_tx_gap_cnt>=AURORA_TX_PERIOD_CLK_NUM)
+		aurora_tx_gap_cnt <= 'd0;
+	else
+		aurora_tx_gap_cnt <= aurora_tx_gap_cnt + 'd1;
+end
+
+//aurora tx start
+always @(posedge clk_sys)
+begin
+	if (aurora_tx_gap_cnt=='d31 && channel_up==1'b1)		//enalbe aurora tx when serdes channel success
+		aurora_tx_start <= 1'b1;
+	else
+		aurora_tx_start <= 1'b0;
+end
+
+always @(posedge clk_sys)
+begin
+	if (reset)
+		aurora_tx_cnt[3:0] <= 4'd0;
+	else if (aurora_tx_start==1'b1)
+		aurora_tx_cnt[3:0] <= 4'd1;
+	else if (aurora_tx_cnt[3:0]>=4'd14)
+		aurora_tx_cnt[3:0] <= 4'd0;
+	else if (aurora_tx_cnt[3:0]>4'd0 && s_axis_tready_debug==1'b1)
+		aurora_tx_cnt[3:0] <= aurora_tx_cnt[3:0] + 4'd1;
+	else ;
+end
+
+//aurora tx shift reg
+always @(posedge clk_sys)
+begin
+	if (aurora_tx_start==1'b1)
+		rxd_data_shift_reg <= rxd_data_o;
+	else if (aurora_tx_cnt[3:0]>4'd0 && s_axis_tready_debug==1'b1)
+		rxd_data_shift_reg <= {8'd0, rxd_data_shift_reg[CH_NUM*8-1:8]};
+	else ;
+end
+
+always @(posedge clk_sys)
+begin
+	if (aurora_tx_start==1'b1 || aurora_tx_cnt[3:0]>4'd0)
+		s_axis_tvalid <= 1'b1;
+	else
+		s_axis_tvalid <= 1'b0;
+end
+
+always @(posedge clk_sys)
+begin
+	if (aurora_tx_cnt[3:0]>=4'd14)
+		s_axis_tlast <= 1'b1;
+	else
+		s_axis_tlast <= 1'b0;
+end
+
+always @(posedge clk_sys)
+begin
+	if (aurora_tx_start==1'b1)
+		s_axis_tdata[31:0] <= AURORA_SERDES_HEADER;
+	else if (aurora_tx_cnt[3:0]>4'd0 && s_axis_tready_debug==1'b1)
+		s_axis_tdata[31:0] <= {FC_HEADER, 4'd0, aurora_tx_cnt[3:0], FC_PAYLOAD, rxd_data_shift_reg[7:0]};
+	else ;
+end
+
+
+
+
+endmodule

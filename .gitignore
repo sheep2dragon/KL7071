@@ -1,0 +1,16 @@
+#ignore dir
+
+Debug/
+Release/
+GeneratedFiles/
+ipch/
+bak/
+prj/
+
+#ignore file type
+*.opensdf
+*.sdf
+*.suo
+*.user
+*.log
+*.filters

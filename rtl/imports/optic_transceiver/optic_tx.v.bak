@@ -1,0 +1,151 @@
+//==========================================================================
+// Data				:	2016-06-14
+// Author			:	Chen Biao
+// Email			:	biao.chen@keliangtek.com
+// purpose			:	
+//--------------------------------------------------------------------------
+// Revision record	:
+// data			person			issue number		detail
+//
+//==========================================================================
+`timescale 1 ns / 1 ns
+
+module optic_tx(
+    input 					reset,
+    input 					clk_sys,
+    input 					clk_tx,					//clk 50m
+    //user interface, clk sys domain
+    input 					tx_wea,
+    input 					tx_waddr,
+    input 		[31:0]		tx_wdata,
+	//tx ctrl, clk tx domain
+    input 					tx_comm_fault,			//0:no fault, 1:fault
+    input 					tx_crc_fault,			//0:no fault, 1:fault
+    input 					trans_start,
+    //serial data
+    output reg 				phy_txd=1'b0
+	);
+
+//-------------------------signal definition--------------------------------
+//-------------------------signal definition--------------------------------
+//clk tx domain
+reg 	[2:0]				tx_raddr;
+wire 	[7:0]				tx_rdata;
+reg 						tx_flag;
+reg 						tx_flag_dly;
+reg 	[2:0]				tx_bit_cnt=3'd0;		//0-7
+reg 	[2:0]				tx_byte_cnt=3'd0;		//0-7, 0:header, 1-2:Vc, 3-4:ST, 5-6:CRC, 7:tail
+reg 						crc_en;
+wire 	[15:0]				crc_result_out;
+wire 						crc_result_ok;
+reg 	[7:0]				tx_shift_reg;
+
+//-------------------------ipcore & module----------------------------------
+//-------------------------ipcore & module----------------------------------
+dpram_w512x32_r2048x8 	U_dpram_optic_tx(
+    .clka(clk_sys),
+    .ena(1'b1),
+    .wea(tx_wea),
+    .addra({8'd0,tx_waddr}),
+    .dina({tx_wdata[7:0],tx_wdata[15:8],tx_wdata[23:16],tx_wdata[31:24]}),
+    .clkb(clk_tx),
+    .enb(1'b1),
+    .addrb({8'd0,tx_raddr[2:0]}), 
+    .doutb(tx_rdata[7:0]) 
+);
+
+crc_tx 			U_crc_tx(
+    .clk(clk_tx),
+    .sclr(trans_start),
+    .data_in(tx_rdata[7:0]),
+    .crc_en(crc_en),
+    .data_out(crc_result_out[15:0]),
+    .data_ok(crc_result_ok)
+  );
+
+//--------------------------------------------------------------------------
+always @(posedge clk_tx)
+begin
+	tx_flag_dly <= tx_flag;
+end
+
+//--------------------------------------------------------------------------
+//--------------------------------------------------------------------------
+//tx flag, hold until tx end
+always @(posedge clk_tx)
+begin
+	if (reset)
+		tx_flag <= 1'b0;
+	else if (trans_start==1'b1)
+		tx_flag <= 1'b1;
+	else if (tx_bit_cnt[2:0]>=3'd7 && tx_byte_cnt[2:0]>=3'd7)
+		tx_flag <= 1'b0;
+	else ;
+end
+
+always @(posedge clk_tx)
+begin
+	if (tx_bit_cnt[2:0]>=3'd7 && tx_byte_cnt[2:0]>=3'd7)
+		tx_bit_cnt[2:0] <= 3'd0;
+	else if (tx_flag==1'b1)
+		tx_bit_cnt[2:0] <= tx_bit_cnt[2:0] + 3'd1;
+	else ;
+end
+
+always @(posedge clk_tx)
+begin
+	if (tx_bit_cnt[2:0]>=3'd7 && tx_byte_cnt[2:0]>=3'd7)
+		tx_byte_cnt[2:0] <= 3'd0;
+	else if (tx_bit_cnt[2:0]>=3'd7)
+		tx_byte_cnt[2:0] <= tx_byte_cnt[2:0] + 3'd1;
+	else ;
+end
+
+//--------------------------------------------------------------------------
+//dpram read, only use first 4 addr, 0-3
+always @(posedge clk_tx)
+begin
+	if (tx_bit_cnt[2:0]==3'd4)
+		tx_raddr[2:0] <= tx_byte_cnt[2:0];
+	else ;
+end
+
+//--------------------------------------------------------------------------
+//crc enable
+always @(posedge clk_tx)
+begin
+	if (tx_crc_fault==1'b0 && tx_bit_cnt[2:0]>=3'd7 && tx_byte_cnt[2:0]<=3'd3)
+		crc_en <= 1'b1;
+	else
+		crc_en <= 1'b0;
+end
+
+//--------------------------------------------------------------------------
+//optic tx
+always @(posedge clk_tx)
+begin
+	if (tx_bit_cnt[2:0]==3'd0)
+		case (tx_byte_cnt[2:0])
+			3'd0:	tx_shift_reg[7:0] <= 8'h01;							//header
+			3'd1,3'd2,3'd3,3'd4:	tx_shift_reg[7:0] <= tx_rdata[7:0];	//Vc, ST
+			3'd5:	tx_shift_reg[7:0] <= crc_result_out[15:8];			//CRC MSB
+			3'd6:	tx_shift_reg[7:0] <= crc_result_out[7:0];			//CRC LSB
+			3'd7:	tx_shift_reg[7:0] <= 8'hFF;
+			default: ;
+		endcase
+	else if (tx_flag==1'b1)
+		tx_shift_reg[7:0] <= {tx_shift_reg[6:0],1'b0};
+	else ;
+end
+
+always @(posedge clk_tx)
+begin
+	if (tx_comm_fault==1'b1)
+		phy_txd <= 1'b0;
+	else if (tx_flag_dly==1'b1)
+		phy_txd <= tx_shift_reg[7];
+	else
+		phy_txd <= ~phy_txd;
+end
+
+endmodule
